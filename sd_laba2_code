@@ -1,0 +1,145 @@
+#include <iostream>
+#include <complex>
+#include <random>
+#include <chrono>
+#include <cmath>
+#include <algorithm>
+#include <omp.h>
+#include <mkl.h>
+
+using namespace std;
+using namespace chrono;
+using ComplexFloat = complex<float>;
+
+class Timer {
+    high_resolution_clock::time_point start;
+public:
+    Timer() : start(high_resolution_clock::now()) {}
+    double elapsed() {
+        auto end = high_resolution_clock::now();
+        duration<double> diff = end - start;
+        return diff.count();
+    }
+};
+
+void init_random(ComplexFloat* A, ComplexFloat* B, int n) {
+    random_device rd;
+    mt19937 gen(rd());
+    uniform_real_distribution<float> dis(-1.0f, 1.0f);
+    for (int i = 0; i < n * n; ++i) {
+        A[i] = ComplexFloat(dis(gen), dis(gen));
+        B[i] = ComplexFloat(dis(gen), dis(gen));
+    }
+}
+
+void multiply_naive(ComplexFloat* A, ComplexFloat* B, ComplexFloat* C, int n) {
+    for (int i = 0; i < n * n; ++i) C[i] = ComplexFloat(0.0f, 0.0f);
+    for (int i = 0; i < n; ++i) {
+        for (int k = 0; k < n; ++k) {
+            ComplexFloat aik = A[i * n + k];
+            for (int j = 0; j < n; ++j) {
+                C[i * n + j] += aik * B[k * n + j];
+            }
+        }
+    }
+}
+
+void multiply_mkl(ComplexFloat* A, ComplexFloat* B, ComplexFloat* C, int n) {
+    ComplexFloat alpha(1.0f, 0.0f);
+    ComplexFloat beta(0.0f, 0.0f);
+
+    cblas_cgemm3m(
+        CblasRowMajor,
+        CblasNoTrans,
+        CblasNoTrans,
+        n, n, n,
+        &alpha,
+        A, n,
+        B, n,
+        &beta,
+        C, n
+    );
+}
+
+void multiply_optimized(ComplexFloat* A, ComplexFloat* B, ComplexFloat* C, int n) {
+    for (int i = 0; i < n * n; ++i) C[i] = ComplexFloat(0.0f, 0.0f);
+    const int BS = 64;
+
+#pragma omp parallel for
+    for (int ii = 0; ii < n; ii += BS) {
+        for (int jj = 0; jj < n; jj += BS) {
+            for (int kk = 0; kk < n; kk += BS) {
+                int ie = (ii + BS < n) ? (ii + BS) : n;
+                int je = (jj + BS < n) ? (jj + BS) : n;
+                int ke = (kk + BS < n) ? (kk + BS) : n;
+
+                for (int i = ii; i < ie; ++i) {
+                    for (int k = kk; k < ke; ++k) {
+                        ComplexFloat aik = A[i * n + k];
+                        ComplexFloat* C_row = &C[i * n + jj];
+                        ComplexFloat* B_row = &B[k * n + jj];
+                        int len = je - jj;
+
+                        for (int j = 0; j < len; ++j) {
+                            C_row[j] += aik * B_row[j];
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+int main() {
+    const int N = 1024;
+    const size_t total = (size_t)N * N;
+
+    cout << "\tLab: Complex Matrix Multiply " << N << "x" << N << "\n\n";
+
+    ComplexFloat* A = (ComplexFloat*)mkl_malloc(total * sizeof(ComplexFloat), 64);
+    ComplexFloat* B = (ComplexFloat*)mkl_malloc(total * sizeof(ComplexFloat), 64);
+    ComplexFloat* C1 = (ComplexFloat*)mkl_malloc(total * sizeof(ComplexFloat), 64);
+    ComplexFloat* C2 = (ComplexFloat*)mkl_malloc(total * sizeof(ComplexFloat), 64);
+    ComplexFloat* C3 = (ComplexFloat*)mkl_malloc(total * sizeof(ComplexFloat), 64);
+
+    cout << "Init random data... \n";
+    init_random(A, B, N);
+
+    double ops = 2.0 * pow((double)N, 3.0);
+    double t1, t2, t3;
+
+    cout << "1. Naive... " << flush;
+    Timer tm1;
+    multiply_naive(A, B, C1, N);
+    t1 = tm1.elapsed();
+    cout << t1 << " sec, " << (ops / t1) * 1e-6 << " MFlops\n";
+
+    cout << "2. MKL (cblas_cgemm3m)... " << flush;
+    multiply_mkl(A, B, C2, N);
+    Timer tm2;
+    multiply_mkl(A, B, C2, N);
+    t2 = tm2.elapsed();
+    cout << t2 << " sec, " << (ops / t2) * 1e-6 << " MFlops\n";
+
+    cout << "3. Optimized (blocked + OpenMP)... " << flush;
+    Timer tm3;
+    multiply_optimized(A, B, C3, N);
+    t3 = tm3.elapsed();
+    cout << t3 << " sec, " << (ops / t3) * 1e-6 << " MFlops\n\n";
+
+    double mflops2 = (ops / t2) * 1e-6;
+    double mflops3 = (ops / t3) * 1e-6;
+    double eff = (mflops3 / mflops2) * 100.0; cout << "\tResults\n";
+    cout << "MKL:       " << mflops2 << " MFlops\n";
+    cout << "Optimized: " << mflops3 << " MFlops\n";
+    cout << "Efficiency vs MKL: " << eff << "%\n";
+
+    if (eff >= 30.0)
+        cout << "Condition (>=30%) PASSED!\n";
+    else
+        cout << "Condition FAILED.\n";
+
+    mkl_free(A); mkl_free(B); mkl_free(C1); mkl_free(C2); mkl_free(C3);
+
+    return 0;
+}
